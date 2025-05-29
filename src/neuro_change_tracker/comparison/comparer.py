@@ -134,6 +134,19 @@ class Comparer:
 if __name__ == '__main__':
     import os
     import time
+    # Ensure Snapshot can be imported if this script is run directly
+    # This might require adjusting PYTHONPATH or running as a module (python -m neuro_change_tracker.comparison.comparer)
+    # For simplicity in this direct script execution context, let's try a common pattern if Snapshot is not found.
+    try:
+        from ..core.snapshot import Snapshot
+    except ImportError:
+        # This is a fallback for direct script execution, assuming a certain project structure.
+        # It's generally better to run such scripts as modules or have PYTHONPATH set up.
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..')) # Go up two levels to src/
+        from neuro_change_tracker.core.snapshot import Snapshot
+
+
     # Dummy model for testing
     class SimpleMLP(torch.nn.Module):
         def __init__(self):
@@ -146,78 +159,74 @@ if __name__ == '__main__':
             x = self.fc2(x)
             return x
 
+    print("[INFO] Initializing test: Creating dummy model and snapshots...")
     # Create some dummy snapshots
     model1 = SimpleMLP()
     snap1_data = {k: v.clone().detach() for k,v in model1.state_dict().items()}
     meta1 = {"epoch": 0, "step": 0, "name": "initial"}
     snapshot1 = Snapshot(snap1_data, meta1)
+    print(f"[INFO] Created Snapshot 0: {meta1}")
 
-    time.sleep(0.1) # ensure different timestamps
+    time.sleep(0.01) # ensure different timestamps, reduced sleep
 
     model2 = SimpleMLP() # Fresh model, same architecture
-    # Change weights for model2 to simulate training
     with torch.no_grad():
         model2.fc1.weight.data += 0.1
         model2.fc2.bias.data -= 0.05
-    
     snap2_data = {k: v.clone().detach() for k,v in model2.state_dict().items()}
     meta2 = {"epoch": 1, "step": 100, "name": "epoch_1"}
     snapshot2 = Snapshot(snap2_data, meta2)
+    print(f"[INFO] Created Snapshot 1: {meta2}")
 
-    time.sleep(0.1)
+    time.sleep(0.01)
 
     model3 = SimpleMLP()
     with torch.no_grad():
-        model3.fc1.weight.data += 0.2
-        model3.fc2.bias.data -= 0.1
+        model3.fc1.weight.data += 0.2 # Cumulative change from model1: 0.1 (from m2) + 0.2 = 0.3
+        model3.fc2.bias.data -= 0.1  # Cumulative change from model1: -0.05 (from m2) - 0.1 = -0.15
     snap3_data = {k: v.clone().detach() for k,v in model3.state_dict().items()}
     meta3 = {"epoch": 2, "step": 200, "name": "epoch_2"}
     snapshot3 = Snapshot(snap3_data, meta3)
+    print(f"[INFO] Created Snapshot 2: {meta3}")
 
     # Initialize Comparer
     comparer = Comparer()
     comparer.add_snapshot(snapshot1)
     comparer.add_snapshot(snapshot2)
     comparer.add_snapshot(snapshot3)
+    print("[INFO] Comparer initialized with 3 snapshots.")
 
-    print("--- Comparing snapshot 0 and 1 (per_layer=True) ---")
-    comp_0_1_per_layer = comparer.compare_snapshots(0, 1, per_layer=True)
-    print(f"Snapshot 1 Meta: {comp_0_1_per_layer['snapshot1_metadata']}")
-    print(f"Snapshot 2 Meta: {comp_0_1_per_layer['snapshot2_metadata']}")
-    print(f"Per-layer L2 distances: {comp_0_1_per_layer['per_layer_L2_distance']}")
-    print(f"Aggregate L2 from layers: {comp_0_1_per_layer['aggregate_L2_distance_from_layers']}")
-
-    print("\n--- Comparing snapshot 0 and 1 (per_layer=False) ---")
-    comp_0_1_total = comparer.compare_snapshots(0, 1, per_layer=False)
-    print(f"Total L2 distance: {comp_0_1_total['total_L2_distance']}")
-
-    print("\n--- Comparing all consecutive snapshots (per_layer=True) ---")
+    print("\n[INFO] --- Comparing all consecutive snapshots (per_layer=True) ---")
     all_consecutive_comps = comparer.compare_consecutive_snapshots(per_layer=True)
+    
+    if not all_consecutive_comps:
+        print("[WARN] No consecutive comparisons generated.")
+    
     for i, comp in enumerate(all_consecutive_comps):
-        print(f"Comparison {i} (Snap {i} vs Snap {i+1}):")
-        print(f"  Aggregate L2: {comp['aggregate_L2_distance_from_layers']}")
-        # print(f"  Layer diffs: {comp['per_layer_L2_distance']}")
+        print(f"\n[RESULT] Comparison {i}: Snapshot {i} vs Snapshot {i+1}")
+        print(f"  Snapshot {i} Metadata: {comp['snapshot1_metadata']}")
+        print(f"  Snapshot {i+1} Metadata: {comp['snapshot2_metadata']}")
+        print(f"  Aggregate L2 Distance (from layers): {comp['aggregate_L2_distance_from_layers']:.4f}")
+        print(f"  Per-layer L2 Distances:")
+        if 'per_layer_L2_distance' in comp:
+            for layer_name, dist in comp['per_layer_L2_distance'].items():
+                print(f"    {layer_name}: {dist:.4f}")
+        else:
+            print("    Per-layer distances not available.")
 
+    print("\n[INFO] --- Detailed comparison: Snapshot 0 and 2 (should show larger changes) ---")
+    comp_0_2_per_layer = comparer.compare_snapshots(0, 2, per_layer=True)
+    print(f"[RESULT] Comparison: Snapshot 0 vs Snapshot 2")
+    print(f"  Snapshot 0 Metadata: {comp_0_2_per_layer['snapshot1_metadata']}")
+    print(f"  Snapshot 2 Metadata: {comp_0_2_per_layer['snapshot2_metadata']}")
+    print(f"  Aggregate L2 Distance (from layers): {comp_0_2_per_layer['aggregate_L2_distance_from_layers']:.4f}")
+    print(f"  Per-layer L2 Distances:")
+    if 'per_layer_L2_distance' in comp_0_2_per_layer:
+        for layer_name, dist in comp_0_2_per_layer['per_layer_L2_distance'].items():
+            print(f"    {layer_name}: {dist:.4f}")
 
-    # Test with state dicts that have different keys (e.g. a layer was added/removed)
-    # This is a more complex scenario that the current L2_distance_state_dicts handles by warning
-    # and calculating norm for non-overlapping keys.
-    print("\n--- Testing comparison with differing state dict keys ---")
-    state_dict_a = {'layer1.weight': torch.randn(5,5), 'layer2.weight': torch.randn(3,3)}
-    state_dict_b = {'layer1.weight': torch.randn(5,5) + 0.5, 'layer3.weight': torch.randn(2,2)}
-    
-    layer_diffs_ab = comparer.L2_distance_state_dicts(state_dict_a, state_dict_b)
-    print(f"Layer diffs for A vs B (structural change): {layer_diffs_ab}")
-    # The total_L2_distance_state_dicts would fail here if not careful because torch.cat requires same num elements
-    # My implementation falls back to summing squares from L2_distance_state_dicts
-    total_diff_ab = comparer.total_L2_distance_state_dicts(state_dict_a, state_dict_b)
-    print(f"Total L2 for A vs B (structural change): {total_diff_ab}")
-    
-    # Test what happens if a layer's shape changes (e.g. fc layer units change)
-    print("\n--- Testing comparison with differing tensor shapes for the same key ---")
-    state_dict_c = {'fc.weight': torch.randn(10,5)}
-    state_dict_d = {'fc.weight': torch.randn(10,8)} # Different shape
-    layer_diffs_cd = comparer.L2_distance_state_dicts(state_dict_c, state_dict_d)
-    print(f"Layer diffs for C vs D (shape change): {layer_diffs_cd}") # Will show -1.0 for fc.weight
-    total_diff_cd = comparer.total_L2_distance_state_dicts(state_dict_c, state_dict_d)
-    print(f"Total L2 for C vs D (shape change): {total_diff_cd}") 
+    # The tests for differing state dict keys and tensor shapes can remain for robustness checks
+    # but are not the primary focus of M3's CLI output goal.
+    # print("\n--- Testing comparison with differing state dict keys ---")
+    # ... (rest of the original example tests can be kept or commented out if too verbose for M3)
+    print("\n[INFO] Test script finished.") 
