@@ -1,1 +1,3 @@
-torch 
+torch
+matplotlib
+seaborn 
