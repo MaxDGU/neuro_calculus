@@ -4,6 +4,7 @@ import torch.optim as optim
 import os
 import time
 import shutil # For cleaning up output directory
+import torch.nn.functional as F # For potential aggregate functions
 
 from neuro_change_tracker import Tracker, Comparer, Plotter, Snapshot
 
@@ -58,7 +59,7 @@ def main():
     dummy_targets = torch.randint(0, 10, (64,)) # Batch of 64 labels
 
     # --- Training Loop & Snapshotting ---
-    print("\n--- Starting Dummy Training Loop ---_tracker.py")
+    print("\n--- Starting Dummy Training Loop ---")
     # Capture initial state
     tracker.capture_snapshot(epoch=-1, step=-1, custom_metadata={"stage": "initialization"})
     print(f"Captured initial snapshot (Epoch -1, Step -1) in {tracker.save_dir}")
@@ -86,20 +87,20 @@ def main():
     # snapshots_list = Tracker.load_snapshots_from_dir(tracker.save_dir)
     # OR, if the tracker object is still available and has them in memory:
     snapshots_list = tracker.get_all_snapshots()
-    if not snapshots_list:
-        print("Error: No snapshots found or loaded. Exiting.")
+    if not snapshots_list or len(snapshots_list) < 2:
+        print("Error: Not enough snapshots found or loaded for detailed analysis. Exiting.")
         return
     print(f"Loaded {len(snapshots_list)} snapshots.")
 
     # 5. Initialize Comparer and Perform Comparisons
     comparer = Comparer()
-    print("\n--- Performing Comparisons --- ")
+    print("\n--- Performing Comparisons (L2 distance plots) --- ")
     consecutive_comparisons = comparer.compare_consecutive_snapshots(snapshots_list, per_layer=True)
     
     if not consecutive_comparisons:
         print("No consecutive comparisons were generated.")
     else:
-        print(f"Generated {len(consecutive_comparisons)} consecutive comparisons.")
+        print(f"Generated {len(consecutive_comparisons)} consecutive comparisons for L2 distance plots.")
         # Print summary of the first comparison as an example
         if consecutive_comparisons:
             first_comp = consecutive_comparisons[0]
@@ -114,11 +115,59 @@ def main():
         print("\n--- Generating Plots --- ")
         plotter = Plotter(comparison_results=consecutive_comparisons, output_dir=PLOT_DIR)
         
-        plotter.plot_total_change_over_epochs(filename="total_model_change_vs_epoch.png")
-        plotter.plot_per_layer_change_over_epochs(filename_prefix="per_layer_model_change")
+        plotter.plot_total_change_over_epochs(filename="total_model_L2_change_vs_epoch.png")
+        plotter.plot_per_layer_change_over_epochs(filename_prefix="per_layer_model_L2_change")
         print(f"Plots saved in {PLOT_DIR}")
     else:
-        print("Skipping plotting as no comparison results are available.")
+        print("Skipping L2 distance plots as no comparison results are available.")
+
+    # --- New M10 Plots --- 
+    print("\n--- Generating M10 Trajectory and Heatmap Plots --- ")
+
+    # 1. Specific Weight Trajectories
+    # For our SimpleMLP: fc1.weight is 128x784, fc1.bias is 128, etc.
+    # Let's plot a few weights from fc1.weight and one from fc3.bias
+    weights_to_track = {
+        "fc1.weight": [(0,0), (0,1), (10,5)], # (row, col) indices
+        "fc3.bias": [(0,)] # (index,) for bias
+    }
+    plotter.plot_specific_weight_trajectories(
+        snapshots=snapshots_list, 
+        weights_to_plot=weights_to_track,
+        filename_prefix="specific_weights"
+    )
+
+    # 2. Layer Aggregate Trajectories
+    aggregate_functions = {
+        "L2_norm": lambda t: t.norm(p=2).item(),
+        "mean_abs_val": lambda t: t.abs().mean().item(),
+        "std_dev": lambda t: t.std().item()
+    }
+    plotter.plot_layer_aggregate_trajectories(
+        snapshots=snapshots_list,
+        aggregate_fns=aggregate_functions,
+        # layer_filter=["fc1.weight", "fc3.bias"], # Optional: filter specific layers
+        filename_prefix="layer_aggregates"
+    )
+
+    # 3. Layer Difference Heatmap
+    # Example: Difference in 'fc1.weight' between initial (snapshot 0) and final (snapshot -1)
+    if len(snapshots_list) >= 2:
+        initial_snapshot = snapshots_list[0]
+        final_snapshot = snapshots_list[-1]
+        plotter.plot_layer_difference_heatmap(
+            initial_snapshot, 
+            final_snapshot, 
+            layer_name="fc1.weight",
+            filename=f"heatmap_fc1.weight_e{initial_snapshot.metadata.get('epoch','i')}_vs_e{final_snapshot.metadata.get('epoch','f')}.png"
+        )
+        # Example for a bias layer
+        plotter.plot_layer_difference_heatmap(
+            initial_snapshot, 
+            final_snapshot, 
+            layer_name="fc2.bias",
+            filename=f"heatmap_fc2.bias_e{initial_snapshot.metadata.get('epoch','i')}_vs_e{final_snapshot.metadata.get('epoch','f')}.png"
+        )
 
     print("\nNeuro Change Tracker full analysis example finished.")
     print(f"Snapshots are in: {tracker.save_dir}")
