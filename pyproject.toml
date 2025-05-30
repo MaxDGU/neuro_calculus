@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuro_change_tracker"
+version = "0.0.1"
+authors = [
+  { name="Your Name", email="you@example.com" }, # TODO: Replace with actual author info
+]
+description = "A system for tracking changes in neural network weights during training."
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License", # TODO: Confirm or change license
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch",
+    "matplotlib",
+    "seaborn",
+]
+
+[project.urls]
+Homepage = "https://github.com/MaxDGU/neuro_calculus"
+Issues = "https://github.com/MaxDGU/neuro_calculus/issues" 

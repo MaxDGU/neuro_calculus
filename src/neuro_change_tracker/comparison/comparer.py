@@ -1,16 +1,35 @@
 import torch
-from typing import Dict, List, Any, Tuple
-from ..core.snapshot import Snapshot # Use relative import
+from typing import Dict, List, Any # Removed Tuple as it wasn't used
+from ..core.snapshot import Snapshot
 
 class Comparer:
+    """
+    Provides methods to compare model snapshots, primarily by calculating L2 distances.
+
+    This class is stateless; comparison methods take Snapshot objects or their state_dicts
+    directly as arguments.
+    """
     def __init__(self):
-        """Comparer is now stateless regarding a list of snapshots."""
+        """Initializes a Comparer object. It is stateless."""
         pass
 
     def L2_distance_state_dicts(self, state_dict1: Dict[str, torch.Tensor], state_dict2: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """
         Computes the L2 distance for each corresponding tensor in two state_dicts.
-        Returns a dictionary parameter_name: L2_distance_value.
+
+        If a parameter key is present in one state_dict but not the other, its L2 norm 
+        in the present state_dict is reported as the distance (as if compared to zero).
+        If parameter shapes or dtypes (after attempting cast) mismatch for the same key, 
+        a distance of -1.0 is reported for that parameter, indicating an invalid comparison.
+
+        Args:
+            state_dict1 (Dict[str, torch.Tensor]): The first model state dictionary.
+            state_dict2 (Dict[str, torch.Tensor]): The second model state dictionary.
+
+        Returns:
+            Dict[str, float]: A dictionary mapping each parameter name (key) to its 
+                              L2 distance. A value of -1.0 indicates an issue with 
+                              comparison for that specific parameter (e.g., shape mismatch).
         """
         distances = {}
         all_keys = set(state_dict1.keys()) | set(state_dict2.keys())
@@ -43,25 +62,53 @@ class Comparer:
 
     def total_L2_distance_state_dicts(self, state_dict1: Dict[str, torch.Tensor], state_dict2: Dict[str, torch.Tensor]) -> float:
         """
-        Computes the total L2 distance between all parameters in two state_dicts.
-        This is done by flattening all parameters into a single vector for each state_dict and then computing L2.
-        Handles potential mismatches in keys or shapes by summing squared valid per-layer distances.
+        Computes an aggregate L2 distance between all parameters in two state_dicts.
+
+        This is calculated as the square root of the sum of squared L2 distances of 
+        individual, validly comparable parameters. Parameters with comparison issues 
+        (e.g., shape mismatches, indicated by -1.0 from `L2_distance_state_dicts`) are 
+        excluded from this sum.
+
+        Args:
+            state_dict1 (Dict[str, torch.Tensor]): The first model state dictionary.
+            state_dict2 (Dict[str, torch.Tensor]): The second model state dictionary.
+
+        Returns:
+            float: The aggregate L2 distance. Returns 0.0 if all validly compared 
+                   parameters are identical. Returns -1.0 if no parameters could be 
+                   validly compared (e.g., all parameters had mismatches).
         """
         param_distances = self.L2_distance_state_dicts(state_dict1, state_dict2)
         valid_distances_sq = [d**2 for d in param_distances.values() if d >= 0]
         
-        if not valid_distances_sq: # Handles cases where all comparisons failed (e.g. all shapes mismatch)
-             # Or if all params are identical across completely different architectures (unlikely but mathematically possible)
+        if not param_distances: # Should not happen if state_dicts are not empty
+            return 0.0 
+        if not valid_distances_sq: 
             if all(d == 0 for d in param_distances.values() if d >=0 ): return 0.0
-            # If all are -1, it means no valid comparison could be made.
-            if all(d < 0 for d in param_distances.values()): return -1.0 # Or raise error
+            if all(d < 0 for d in param_distances.values()): return -1.0
+            return 0.0 # Or handle as an error if expected valid distances
 
         return sum(valid_distances_sq)**0.5
 
     def compare_snapshots(self, snapshot1: Snapshot, snapshot2: Snapshot, per_layer: bool = True) -> Dict[str, Any]:
         """
-        Compares two Snapshot objects.
-        Returns a dictionary with comparison results.
+        Compares two Snapshot objects and returns a dictionary of comparison results.
+
+        Args:
+            snapshot1 (Snapshot): The first snapshot.
+            snapshot2 (Snapshot): The second snapshot.
+            per_layer (bool, optional): If True, computes and includes per-layer L2 distances 
+                                      and an aggregate L2 distance derived from these. 
+                                      If False, computes only a single total L2 distance. 
+                                      Defaults to True.
+
+        Returns:
+            Dict[str, Any]: A dictionary containing metadata from both snapshots, 
+                            the comparison type (e.g., "L2_distance"), and the 
+                            calculated distance(s). Structure depends on `per_layer`:
+                            - If `per_layer` is True: includes "per_layer_L2_distance" (Dict) 
+                              and "aggregate_L2_distance_from_layers" (float).
+                            - If `per_layer` is False: includes "total_L2_distance" (float).
         """
         results = {
             "snapshot1_metadata": snapshot1.metadata,
@@ -73,13 +120,18 @@ class Comparer:
             distances = self.L2_distance_state_dicts(snapshot1.model_state, snapshot2.model_state)
             results["per_layer_L2_distance"] = distances
             valid_distances_sq = [d**2 for d in distances.values() if d >= 0]
-            results["aggregate_L2_distance_from_layers"] = sum(valid_distances_sq)**0.5 if valid_distances_sq else 0.0
-            if all(d < 0 for d in distances.values()): # If all were invalid
-                 results["aggregate_L2_distance_from_layers"] = -1.0
+            
+            current_aggregate_dist = -1.0 # Default if no valid distances
+            if valid_distances_sq: # If there are any valid squared distances
+                current_aggregate_dist = sum(valid_distances_sq)**0.5
+            elif not distances: # No distances at all (empty state dicts?)
+                 current_aggregate_dist = 0.0
+            elif all(d == 0 for d in distances.values() if d >=0): # All valid distances are zero
+                 current_aggregate_dist = 0.0
+            # If distances exist but all are < 0 (invalid), current_aggregate_dist remains -1.0
+            results["aggregate_L2_distance_from_layers"] = current_aggregate_dist
 
         else:
-            # This simpler total L2 assumes model structure is identical for concatenation approach.
-            # The refactored total_L2_distance_state_dicts is more robust now.
             total_distance = self.total_L2_distance_state_dicts(snapshot1.model_state, snapshot2.model_state)
             results["total_L2_distance"] = total_distance
             
@@ -87,7 +139,18 @@ class Comparer:
 
     def compare_consecutive_snapshots(self, snapshots: List[Snapshot], per_layer: bool = True) -> List[Dict[str, Any]]:
         """
-        Compares all consecutive snapshots in the provided list.
+        Compares all consecutive snapshots in a provided list.
+
+        Args:
+            snapshots (List[Snapshot]): A list of `Snapshot` objects, ordered by time 
+                                      or training progression.
+            per_layer (bool, optional): Passed to `compare_snapshots` for each pair. 
+                                      Defaults to True.
+
+        Returns:
+            List[Dict[str, Any]]: A list of comparison result dictionaries, one for each 
+                                  consecutive pair of snapshots. Returns an empty list 
+                                  if fewer than two snapshots are provided.
         """
         comparisons = []
         if len(snapshots) < 2:
@@ -100,7 +163,7 @@ class Comparer:
             comparisons.append(comparison_result)
         return comparisons
 
-# Example Usage (for testing, to be moved to a test script or notebook)
+# Example Usage (for testing, primary example is run_analysis_example.py)
 if __name__ == '__main__':
     import os
     import time

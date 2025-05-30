@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 # Assuming comparison results are structured as list of dicts from Comparer
 # Each dict would look like:
@@ -14,117 +14,163 @@ from typing import List, Dict, Any, Optional
 # }
 
 class Plotter:
+    """
+    Generates plots to visualize weight changes from comparison results.
+
+    The plotter takes a list of comparison result dictionaries, typically generated
+    by the `Comparer` class, and produces plots for total and per-layer weight 
+    changes over epochs (or snapshot indices).
+
+    Expected structure for each dict in `comparison_results`:
+    {
+        "snapshot1_metadata": { "epoch": int, ... },
+        "snapshot2_metadata": { "epoch": int, ... },
+        "aggregate_L2_distance_from_layers": float,
+        "per_layer_L2_distance": { "layer_name1": float, "layer_name2": float, ... }
+        ...
+    }
+    """
     def __init__(self, comparison_results: List[Dict[str, Any]], output_dir: str = "neuro_plots"):
+        """
+        Initializes a Plotter object.
+
+        Args:
+            comparison_results (List[Dict[str, Any]]): A list of dictionaries, where 
+                each dictionary contains the results of comparing two snapshots.
+            output_dir (str, optional): The directory where generated plots will be 
+                                      saved. Defaults to "neuro_plots".
+        """
         self.comparison_results = comparison_results
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
-        sns.set_theme(style="whitegrid")
+        sns.set_theme(style="whitegrid") # Apply a seaborn theme for aesthetics
 
     def plot_total_change_over_epochs(self, filename: str = "total_change_vs_epoch.png"):
-        """Plots the total weight change (aggregate L2 distance) over epochs."""
+        """
+        Plots the total weight change (aggregate L2 distance) over epochs.
+
+        The x-axis represents the epoch of the second snapshot in each comparison pair.
+        If epoch information is missing, it falls back to using the comparison index.
+
+        Args:
+            filename (str, optional): The name for the output plot file. 
+                                      Defaults to "total_change_vs_epoch.png".
+        """
         if not self.comparison_results:
-            print("No comparison results to plot.")
+            print("[Plotter] No comparison results to plot for total change.")
             return
 
         epochs = []
         total_changes = []
 
-        for comp in self.comparison_results:
-            # Assuming comparison is between epoch N and N+1, associate change with epoch N+1
-            # or the midpoint, or simply the index of comparison.
-            # For simplicity, let's use the epoch of the second snapshot.
+        for i, comp in enumerate(self.comparison_results):
+            epoch_val = None
             if comp.get("snapshot2_metadata") and comp["snapshot2_metadata"].get("epoch") is not None:
-                epochs.append(comp["snapshot2_metadata"]["epoch"])
+                epoch_val = comp["snapshot2_metadata"]["epoch"]
             else:
-                # Fallback if epoch info is missing, use index (less ideal)
-                epochs.append(len(epochs))
+                epoch_val = i # Fallback to index if epoch is not available
+            epochs.append(epoch_val)
             
-            total_changes.append(comp.get("aggregate_L2_distance_from_layers", 0))
+            change_val = comp.get("aggregate_L2_distance_from_layers")
+            if change_val is None or change_val < 0: # Handle missing or invalid (-1) aggregate distances
+                print(f"[Plotter] Warning: Missing or invalid aggregate change for comparison index {i}. Using 0 for plot.")
+                total_changes.append(0) # Or np.nan if preferred, but 0 is simpler for basic plot
+            else:
+                total_changes.append(change_val)
 
-        if not epochs or not total_changes:
-            print("Could not extract epochs or total changes for plotting.")
+        if not epochs:
+            print("[Plotter] Could not extract sufficient data for plotting total change.")
             return
 
-        plt.figure(figsize=(10, 6))
-        plt.plot(epochs, total_changes, marker='o', linestyle='-')
-        plt.title('Total Weight Change (Aggregate L2 Distance) Over Epochs')
-        plt.xlabel('Epoch')
-        plt.ylabel('Aggregate L2 Distance')
-        plt.grid(True)
+        plt.figure(figsize=(12, 7))
+        plt.plot(epochs, total_changes, marker='o', linestyle='-', color='b')
+        plt.title('Total Model Weight Change (Aggregate L2 Distance) Over Training Progression', fontsize=16)
+        plt.xlabel('Epoch / Snapshot Index of Second Snapshot in Pair', fontsize=12)
+        plt.ylabel('Aggregate L2 Distance', fontsize=12)
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.tight_layout()
         
         filepath = os.path.join(self.output_dir, filename)
         plt.savefig(filepath)
         plt.close()
-        print(f"Plot saved to {filepath}")
+        print(f"[Plotter] Plot saved: {filepath}")
 
     def plot_per_layer_change_over_epochs(self, filename_prefix: str = "layer_change_vs_epoch"):
-        """Plots the L2 distance change for each layer over epochs."""
+        """
+        Plots the L2 distance change for each layer over epochs (or snapshot indices).
+
+        Generates a separate plot for each layer found in the comparison results.
+        The x-axis uses epoch data if available from the second snapshot in a pair,
+        otherwise falls back to an index.
+
+        Args:
+            filename_prefix (str, optional): The prefix for the output plot filenames. 
+                                             Each plot will be named 
+                                             `{filename_prefix}_{layer_name}.png`. 
+                                             Defaults to "layer_change_vs_epoch".
+        """
         if not self.comparison_results:
-            print("No comparison results to plot.")
+            print("[Plotter] No comparison results to plot for per-layer changes.")
             return
 
         layer_names = set()
         for comp in self.comparison_results:
-            if "per_layer_L2_distance" in comp:
+            if "per_layer_L2_distance" in comp and isinstance(comp["per_layer_L2_distance"], dict):
                 layer_names.update(comp["per_layer_L2_distance"].keys())
         
         if not layer_names:
-            print("No per-layer distance information found.")
+            print("[Plotter] No per-layer distance information found or layers are not in dict format.")
             return
 
-        # Prepare data for plotting: {layer_name: {'epochs': [], 'changes': []}}
-        plot_data: Dict[str, Dict[str, List[Any]]] = {name: {"epochs": [], "changes": []} for name in layer_names}
+        plot_data: Dict[str, Dict[str, List[Any]]] = {name: {"x_axis_vals": [], "changes": []} for name in layer_names}
 
-        for comp in self.comparison_results:
-            epoch = None
+        for i, comp in enumerate(self.comparison_results):
+            x_val = None
             if comp.get("snapshot2_metadata") and comp["snapshot2_metadata"].get("epoch") is not None:
-                epoch = comp["snapshot2_metadata"]["epoch"]
+                x_val = comp["snapshot2_metadata"]["epoch"]
             else:
-                # If epoch is not found in snapshot2, try snapshot1, or assign a default
-                # This part needs careful handling based on how comparisons are structured.
-                # For now, we'll skip if epoch is indeterminable for a data point for a layer.
-                pass # Fallback to index might be needed if epochs are sparse or irregular
+                x_val = i # Fallback to comparison index
 
-            if "per_layer_L2_distance" in comp:
+            if "per_layer_L2_distance" in comp and isinstance(comp["per_layer_L2_distance"], dict):
                 for layer_name, dist in comp["per_layer_L2_distance"].items():
-                    current_epoch_for_layer = epoch
-                    if current_epoch_for_layer is None:
-                        # If epoch from metadata is None, use the count of existing data points for this layer as x-axis
-                        current_epoch_for_layer = len(plot_data[layer_name]["epochs"])
-                    
-                    plot_data[layer_name]["epochs"].append(current_epoch_for_layer)
-                    plot_data[layer_name]["changes"].append(dist)
+                    if layer_name in plot_data: # Ensure layer was identified initially
+                        plot_data[layer_name]["x_axis_vals"].append(x_val)
+                        if dist is None or dist < 0: # Handle missing or invalid (-1) distances
+                            print(f"[Plotter] Warning: Missing or invalid distance for layer '{layer_name}' at index {i}. Using 0 for plot.")
+                            plot_data[layer_name]["changes"].append(0)
+                        else:
+                            plot_data[layer_name]["changes"].append(dist)
         
-        num_layers = len(layer_names)
-        if num_layers == 0:
-            print("No layers to plot.")
+        if not any(plot_data[name]["x_axis_vals"] for name in layer_names):
+            print("[Plotter] No valid data points found to plot for any layer.")
             return
-
-        # Create a single figure with subplots for each layer if few, or individual plots if many.
-        # For simplicity, let's start with individual plots per layer.
 
         for layer_name in sorted(list(layer_names)):
             data = plot_data[layer_name]
-            if not data["epochs"] or not data["changes"]:
-                print(f"No data to plot for layer: {layer_name}")
+            if not data["x_axis_vals"] or not data["changes"]:
+                # This check might be redundant due to the one above, but good for safety
+                print(f"[Plotter] No data to plot for layer: {layer_name}")
                 continue
 
-            plt.figure(figsize=(10, 6))
-            plt.plot(data["epochs"], data["changes"], marker='o', linestyle='-')
-            plt.title(f'Weight Change (L2 Distance) for Layer: {layer_name} Over Epochs')
-            plt.xlabel('Epoch / Snapshot Index') # Label might need to be more generic if epochs aren't always present
-            plt.ylabel('L2 Distance')
-            plt.grid(True)
+            plt.figure(figsize=(12, 7))
+            plt.plot(data["x_axis_vals"], data["changes"], marker='o', linestyle='-')
+            plt.title(f'Weight Change (L2 Distance) for Layer: {layer_name}', fontsize=16)
+            plt.xlabel('Epoch / Snapshot Index of Second Snapshot in Pair', fontsize=12)
+            plt.ylabel('L2 Distance', fontsize=12)
+            plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+            plt.tight_layout()
             
-            layer_filename = f"{filename_prefix}_{layer_name.replace('.', '_')}.png"
+            # Sanitize layer_name for filename
+            safe_layer_name = layer_name.replace('.', '_').replace('[', '_').replace(']', '')
+            layer_filename = f"{filename_prefix}_{safe_layer_name}.png"
             filepath = os.path.join(self.output_dir, layer_filename)
             plt.savefig(filepath)
             plt.close()
-            print(f"Plot saved to {filepath}")
+            print(f"[Plotter] Plot saved: {filepath}")
 
-# Example Usage (for testing, to be integrated or called from another script)
+# Example Usage (primary example is run_analysis_example.py)
 if __name__ == '__main__':
-    # Dummy comparison results (replace with actual results from Comparer)
+    # Dummy comparison results
     dummy_comparison_results = [
         {
             "snapshot1_metadata": {"epoch": 0, "step": 0, "name": "initial"},
