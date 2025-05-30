@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import torch
+import numpy as np # For histogram binning if needed
 from typing import List, Dict, Any, Callable, Tuple, Optional
 
 from ..core.snapshot import Snapshot
@@ -52,6 +53,54 @@ class Plotter:
         sns.set_theme(style="whitegrid")
         self.epsilon = 1e-8 # For stable division in percentage change
 
+    def _sanitize_filename_component(self, component: str) -> str:
+        """Sanitizes a string component for use in a filename."""
+        # Replace problematic characters with underscores
+        return str(component).replace('.', '_').replace('[', '_').replace(']', '').replace('(', '').replace(')', '').replace(',', '_').replace(' ', '')
+
+    def _get_x_axis_values_and_label(self, items_with_metadata: List[Any]) -> Tuple[List[Any], str]:
+        """
+        Determines x-axis values and a label from a list of items having metadata.
+        Items can be Snapshots or metadata dictionaries.
+        Prioritizes 'epoch', then 'step', then list index.
+        """
+        x_values = []
+        labels_found = set()
+
+        for i, item in enumerate(items_with_metadata):
+            meta = {}
+            if isinstance(item, Snapshot):
+                meta = item.metadata
+            elif isinstance(item, dict): # Assuming it's a metadata dict itself or part of comparison result
+                if "snapshot1_metadata" in item and "snapshot2_metadata" in item: # Comparison dict
+                    meta = item.get("snapshot2_metadata", {}) # Use metadata of the second snapshot for progression
+                else: # Direct metadata dict
+                    meta = item
+            
+            if meta.get("epoch") is not None:
+                x_values.append(meta["epoch"])
+                labels_found.add("Epoch")
+            elif meta.get("step") is not None:
+                x_values.append(meta["step"])
+                labels_found.add("Step")
+            else:
+                x_values.append(i)
+                labels_found.add("Snapshot Index")
+        
+        if "Epoch" in labels_found:
+            x_label = "Epoch"
+        elif "Step" in labels_found:
+            x_label = "Step"
+        else:
+            x_label = "Snapshot Index"
+        
+        # If mixed, and epoch is present, prefer epoch for consistency if some items only have index
+        # This logic ensures if ANY item has epoch, label is epoch. If ANY has step (and no epoch), label is step.
+        if not x_values: # Should not happen if items_with_metadata is not empty
+            return [], "Snapshot Index"
+            
+        return x_values, x_label
+
     def plot_total_change_over_epochs(self, filename: str = "total_change_vs_epoch.png"):
         """
         Plots the total weight change (aggregate L2 distance) over epochs.
@@ -67,44 +116,32 @@ class Plotter:
             print("[Plotter] No comparison results to plot for total change.")
             return
 
-        epochs = []
+        # Use metadata from the second snapshot in each pair for the x-axis
+        # Each item in self.comparison_results is a dict that should contain snapshot2_metadata
+        x_values, x_label = self._get_x_axis_values_and_label(self.comparison_results)
         total_changes = []
-        x_axis_label = "Epoch / Snapshot Index of Second Snapshot in Pair"
 
-        for i, comp in enumerate(self.comparison_results):
-            epoch_val = None
-            metadata2 = comp.get("snapshot2_metadata", {})
-            
-            if metadata2.get("epoch") is not None:
-                epoch_val = metadata2["epoch"]
-                x_axis_label = "Epoch of Second Snapshot in Pair"
-            elif metadata2.get("step") is not None: # Fallback to step
-                epoch_val = metadata2["step"]
-                x_axis_label = "Step of Second Snapshot in Pair"
-            else: # Fallback to index
-                epoch_val = i 
-            epochs.append(epoch_val)
-            
-            change_val = comp.get("aggregate_L2_distance_from_layers")
+        for i, comp_res in enumerate(self.comparison_results):
+            change_val = comp_res.get("aggregate_L2_distance_from_layers")
             if change_val is None or change_val < 0: 
-                print(f"[Plotter] Warning: Missing or invalid aggregate change for comparison index {i} (data: {metadata2}). Using 0 for plot.")
-                total_changes.append(0) 
+                print(f"[Plotter] Warning: Missing/invalid aggregate L2 change for item {i}. Using 0.")
+                total_changes.append(0)
             else:
                 total_changes.append(change_val)
-
-        if not epochs:
-            print("[Plotter] Could not extract sufficient data for plotting total change.")
+        
+        if not x_values or not total_changes or len(x_values) != len(total_changes):
+            print("[Plotter] Insufficient data for plotting total change after processing.")
             return
 
         plt.figure(figsize=(12, 7))
-        plt.plot(epochs, total_changes, marker='o', linestyle='-', color='b')
+        plt.plot(x_values, total_changes, marker='o', linestyle='-', color='b')
         plt.title('Total Model Weight Change (Aggregate L2 Distance) Over Training Progression', fontsize=16)
-        plt.xlabel(x_axis_label, fontsize=12)
+        plt.xlabel(f"{x_label} of Second Snapshot in Pair", fontsize=12)
         plt.ylabel('Aggregate L2 Distance', fontsize=12)
         plt.grid(True, which="both", linestyle="--", linewidth=0.5)
         plt.tight_layout()
         
-        filepath = os.path.join(self.output_dir, filename)
+        filepath = os.path.join(self.output_dir, self._sanitize_filename_component(filename))
         plt.savefig(filepath)
         plt.close()
         print(f"[Plotter] Plot saved: {filepath}")
@@ -127,69 +164,48 @@ class Plotter:
             print("[Plotter] No comparison results to plot for per-layer changes.")
             return
 
-        layer_names = set()
-        for comp in self.comparison_results:
-            if "per_layer_L2_distance" in comp and isinstance(comp["per_layer_L2_distance"], dict):
-                layer_names.update(comp["per_layer_L2_distance"].keys())
-        
-        if not layer_names:
-            print("[Plotter] No per-layer distance information found or layers are not in dict format.")
-            return
+        layer_data: Dict[str, Dict[str, List[Any]]] = {}
+        overall_x_values, overall_x_label = self._get_x_axis_values_and_label(self.comparison_results)
 
-        plot_data: Dict[str, Dict[str, List[Any]]] = {name: {"x_axis_vals": [], "changes": []} for name in layer_names}
-        x_axis_label_base = "Epoch / Snapshot Index of Second Snapshot in Pair"
-
-
-        for i, comp in enumerate(self.comparison_results):
-            x_val = None
-            metadata2 = comp.get("snapshot2_metadata", {})
-            current_x_axis_label = x_axis_label_base # Default for this comparison
-
-            if metadata2.get("epoch") is not None:
-                x_val = metadata2["epoch"]
-                current_x_axis_label = "Epoch of Second Snapshot in Pair"
-            elif metadata2.get("step") is not None:
-                x_val = metadata2["step"]
-                current_x_axis_label = "Step of Second Snapshot in Pair"
+        for i, comp_res in enumerate(self.comparison_results):
+            if "per_layer_L2_distance" in comp_res and isinstance(comp_res["per_layer_L2_distance"], dict):
+                for layer_name, dist in comp_res["per_layer_L2_distance"].items():
+                    if layer_name not in layer_data:
+                        layer_data[layer_name] = {"x_vals": [None] * len(overall_x_values), "changes": [None] * len(overall_x_values)}
+                    
+                    layer_data[layer_name]["x_vals"][i] = overall_x_values[i]
+                    if dist is None or dist < 0:
+                        print(f"[Plotter] Warning: Missing/invalid L2 for layer '{layer_name}', item {i}. Using 0.")
+                        layer_data[layer_name]["changes"][i] = 0
+                    else:
+                        layer_data[layer_name]["changes"][i] = dist
             else:
-                x_val = i 
+                 print(f"[Plotter] Warning: Missing 'per_layer_L2_distance' in comparison item {i}.")
 
-            if "per_layer_L2_distance" in comp and isinstance(comp["per_layer_L2_distance"], dict):
-                for layer_name, dist in comp["per_layer_L2_distance"].items():
-                    if layer_name in plot_data: 
-                        plot_data[layer_name]["x_axis_vals"].append(x_val)
-                        if dist is None or dist < 0: 
-                            print(f"[Plotter] Warning: Missing or invalid L2 distance for layer '{layer_name}' at index {i} (data: {metadata2}). Using 0.")
-                            plot_data[layer_name]["changes"].append(0)
-                        else:
-                            plot_data[layer_name]["changes"].append(dist)
-                        # Store the most specific x-axis label found
-                        if "x_label" not in plot_data[layer_name] or current_x_axis_label != x_axis_label_base :
-                             plot_data[layer_name]["x_label"] = current_x_axis_label
-        
-        if not any(plot_data[name]["x_axis_vals"] for name in layer_names):
-            print("[Plotter] No valid data points found to plot for any layer.")
+        if not layer_data:
+            print("[Plotter] No per-layer L2 data found to plot.")
             return
 
-        for layer_name in sorted(list(layer_names)):
-            data = plot_data[layer_name]
-            if not data["x_axis_vals"] or not data["changes"]:
-                print(f"[Plotter] No data to plot for layer: {layer_name}")
-                continue
+        for layer_name in sorted(layer_data.keys()):
+            # Filter out None placeholders if some comparisons didn't have this layer (shouldn't happen with current Comparer)
+            current_x_vals = [x for x,y in zip(layer_data[layer_name]["x_vals"], layer_data[layer_name]["changes"]) if y is not None]
+            current_changes = [y for y in layer_data[layer_name]["changes"] if y is not None]
             
-            final_x_label = data.get("x_label", x_axis_label_base)
+            if not current_x_vals or not current_changes:
+                print(f"[Plotter] No valid data points to plot for layer: {layer_name}")
+                continue
 
             plt.figure(figsize=(12, 7))
-            plt.plot(data["x_axis_vals"], data["changes"], marker='o', linestyle='-')
-            plt.title(f'Weight Change (L2 Distance) for Layer: {layer_name}', fontsize=16)
-            plt.xlabel(final_x_label, fontsize=12)
+            plt.plot(current_x_vals, current_changes, marker='o', linestyle='-')
+            plt.title(f'L2 Distance Change for Layer: {layer_name}', fontsize=16)
+            plt.xlabel(f"{overall_x_label} of Second Snapshot in Pair", fontsize=12)
             plt.ylabel('L2 Distance', fontsize=12)
             plt.grid(True, which="both", linestyle="--", linewidth=0.5)
             plt.tight_layout()
             
-            safe_layer_name = layer_name.replace('.', '_').replace('[', '_').replace(']', '')
-            layer_filename = f"{filename_prefix}_{safe_layer_name}.png"
-            filepath = os.path.join(self.output_dir, layer_filename)
+            safe_layer_name = self._sanitize_filename_component(layer_name)
+            plot_filename = f"{self._sanitize_filename_component(filename_prefix)}_{safe_layer_name}.png"
+            filepath = os.path.join(self.output_dir, plot_filename)
             plt.savefig(filepath)
             plt.close()
             print(f"[Plotter] Plot saved: {filepath}")
@@ -216,81 +232,47 @@ class Plotter:
             print("[Plotter] No specific weights designated for plotting.")
             return
 
-        plot_data: Dict[str, Dict[str, List[Any]]] = {}
-        x_axis_label = "Epoch / Snapshot Index" # Default
+        overall_x_values, overall_x_label = self._get_x_axis_values_and_label(snapshots)
+        plot_data_collected: Dict[str, Dict[str, List[Any]]] = {}
 
         for i, snap in enumerate(snapshots):
-            current_x_val = i # Default to index
-            current_x_axis_label = "Snapshot Index"
-
-            if "epoch" in snap.metadata and snap.metadata["epoch"] is not None:
-                current_x_val = snap.metadata["epoch"]
-                current_x_axis_label = "Epoch"
-            elif "step" in snap.metadata and snap.metadata["step"] is not None: # Fallback to step
-                current_x_val = snap.metadata["step"]
-                current_x_axis_label = "Step"
-            
-            # Use the most specific label found across snapshots for consistency in plot titles
-            if current_x_axis_label != "Snapshot Index" and x_axis_label == "Epoch / Snapshot Index":
-                x_axis_label = current_x_axis_label
-            elif current_x_axis_label == "Epoch" and x_axis_label == "Step": # Prioritize Epoch if both step/epoch seen
-                x_axis_label = "Epoch"
-
-
             for layer_name, indices_list in weights_to_plot.items():
                 if layer_name not in snap.model_state:
                     continue
-                
                 layer_tensor = snap.model_state[layer_name]
                 for index_tuple in indices_list:
                     try:
                         weight_val = layer_tensor[index_tuple].item()
-                        # Sanitize index_tuple for filename and dict key
-                        index_str_sanitized = str(index_tuple).replace(', ', '_').replace('(', '').replace(')', '').replace(',', '')
-                        dict_key = f"{layer_name}_idx_{index_str_sanitized}"
+                        index_str_sanitized = self._sanitize_filename_component(str(index_tuple))
+                        dict_key = f"{self._sanitize_filename_component(layer_name)}_idx_{index_str_sanitized}"
 
-
-                        if dict_key not in plot_data:
-                            plot_data[dict_key] = {"x_axis_vals": [], "values": [], "layer": layer_name, "index": str(index_tuple), "x_label_type": x_axis_label}
+                        if dict_key not in plot_data_collected:
+                            plot_data_collected[dict_key] = {"x_vals": [], "values": [], "layer": layer_name, "index_str": str(index_tuple)}
                         
-                        plot_data[dict_key]["x_axis_vals"].append(current_x_val)
-                        plot_data[dict_key]["values"].append(weight_val)
-                        # Update general x-axis label if a more specific one (epoch/step) is found
-                        if x_axis_label == "Epoch / Snapshot Index" and current_x_axis_label != "Snapshot Index":
-                             plot_data[dict_key]["x_label_type"] = current_x_axis_label
-                        elif x_axis_label == "Step" and current_x_axis_label == "Epoch":
-                             plot_data[dict_key]["x_label_type"] = "Epoch"
-
-
+                        plot_data_collected[dict_key]["x_vals"].append(overall_x_values[i])
+                        plot_data_collected[dict_key]["values"].append(weight_val)
                     except IndexError:
-                        print(f"[Plotter] Warning: Index {index_tuple} out of bounds for layer '{layer_name}' in snapshot {i} (metadata: {snap.metadata}).")
+                        print(f"[Plotter] Index {index_tuple} out of bounds for '{layer_name}' in snapshot {i}.")
                     except Exception as e:
-                        print(f"[Plotter] Error accessing weight {layer_name}{index_tuple} in snapshot {i} (metadata: {snap.metadata}): {e}")
+                        print(f"[Plotter] Error accessing {layer_name}{index_tuple} in snapshot {i}: {e}")
 
-        if not plot_data:
-            print("[Plotter] No valid data collected for specific weight trajectories.")
+        if not plot_data_collected:
+            print("[Plotter] No data collected for specific weight trajectories.")
             return
 
-        final_x_label_type = "Snapshot Index" # Fallback
-        # Determine the most specific overall x-axis label to use from all collected data
-        labels_seen = {data.get("x_label_type", "Snapshot Index") for data in plot_data.values()}
-        if "Epoch" in labels_seen: final_x_label_type = "Epoch"
-        elif "Step" in labels_seen: final_x_label_type = "Step"
-
-
-        for key, data in plot_data.items():
-            if not data["x_axis_vals"] or not data["values"]:
+        for key, data in plot_data_collected.items():
+            if not data["x_vals"] or not data["values"]:
                 continue
             
             plt.figure(figsize=(12, 7))
-            plt.plot(data["x_axis_vals"], data["values"], marker='o', linestyle='-')
-            plt.title(f'Trajectory for Weight: {data["layer"]}{data["index"]}', fontsize=16)
-            plt.xlabel(final_x_label_type, fontsize=12)
+            plt.plot(data["x_vals"], data["values"], marker='o', linestyle='-')
+            plt.title(f'Trajectory for Weight: {data["layer"]}{data["index_str"]}', fontsize=16)
+            plt.xlabel(overall_x_label, fontsize=12)
             plt.ylabel('Weight Value', fontsize=12)
             plt.grid(True, which="both", linestyle="--", linewidth=0.5)
             plt.tight_layout()
             
-            plot_filename = f"{filename_prefix}_{key}.png"
+            plot_filename = f"{self._sanitize_filename_component(filename_prefix)}_{key}.png"
             filepath = os.path.join(self.output_dir, plot_filename)
             plt.savefig(filepath)
             plt.close()
@@ -321,60 +303,44 @@ class Plotter:
             print("[Plotter] No aggregate functions provided.")
             return
 
-        plot_data: Dict[str, Dict[str, Dict[str, List[Any]]]] = {fn_name: {} for fn_name in aggregate_fns.keys()}
-        processed_layers = set()
-        determined_x_label = "Snapshot Index" # Fallback
-
+        overall_x_values, overall_x_label = self._get_x_axis_values_and_label(snapshots)
+        # Data: { agg_fn_name: { layer_name: {"x_vals": [], "values": []} } }
+        plot_data_collected: Dict[str, Dict[str, Dict[str, List[Any]]]] = {fn_name: {} for fn_name in aggregate_fns.keys()}
+        
         for i, snap in enumerate(snapshots):
-            current_x_val = i
-            current_x_label_type = "Snapshot Index"
-
-            if "epoch" in snap.metadata and snap.metadata["epoch"] is not None:
-                current_x_val = snap.metadata["epoch"]
-                current_x_label_type = "Epoch"
-            elif "step" in snap.metadata and snap.metadata["step"] is not None:
-                current_x_val = snap.metadata["step"]
-                current_x_label_type = "Step"
-
-            if determined_x_label == "Snapshot Index" and current_x_label_type != "Snapshot Index":
-                determined_x_label = current_x_label_type
-            elif determined_x_label == "Step" and current_x_label_type == "Epoch":
-                determined_x_label = "Epoch" # Prioritize Epoch
-
             for layer_name, layer_tensor in snap.model_state.items():
                 if layer_filter and layer_name not in layer_filter:
                     continue
-                processed_layers.add(layer_name)
-
                 for fn_name, agg_fn in aggregate_fns.items():
                     try:
                         stat_val = agg_fn(layer_tensor)
-                        if layer_name not in plot_data[fn_name]:
-                            plot_data[fn_name][layer_name] = {"x_axis_vals": [], "values": []}
-                        
-                        plot_data[fn_name][layer_name]["x_axis_vals"].append(current_x_val)
-                        plot_data[fn_name][layer_name]["values"].append(stat_val)
+                        if layer_name not in plot_data_collected[fn_name]:
+                            plot_data_collected[fn_name][layer_name] = {"x_vals": [], "values": []}
+                        plot_data_collected[fn_name][layer_name]["x_vals"].append(overall_x_values[i])
+                        plot_data_collected[fn_name][layer_name]["values"].append(stat_val)
                     except Exception as e:
-                        print(f"[Plotter] Error computing aggregate '{fn_name}' for layer '{layer_name}' in snap {i} (meta: {snap.metadata}): {e}")
+                        print(f"[Plotter] Error computing aggregate '{fn_name}' for '{layer_name}' in snapshot {i}: {e}")
 
-        if not processed_layers:
-            print("[Plotter] No layers processed for aggregate trajectories (check filter or snapshot content).")
+        if not any(plot_data_collected.values()):
+            print("[Plotter] No data collected for layer aggregate trajectories.")
             return
 
-        for fn_name, layer_data_map in plot_data.items():
+        for fn_name, layer_data_map in plot_data_collected.items():
+            if not layer_data_map: continue
             plt.figure(figsize=(12, 7))
             for layer_name, data in sorted(layer_data_map.items()):
-                if data["x_axis_vals"] and data["values"]:
-                    plt.plot(data["x_axis_vals"], data["values"], marker='o', linestyle='-', label=layer_name)
+                if data["x_vals"] and data["values"]:
+                    plt.plot(data["x_vals"], data["values"], marker='o', linestyle='-', label=layer_name)
             
             plt.title(f'Trajectory of Layer Aggregate: {fn_name}', fontsize=16)
-            plt.xlabel(determined_x_label, fontsize=12) # Use the determined label
+            plt.xlabel(overall_x_label, fontsize=12)
             plt.ylabel('Aggregate Value', fontsize=12)
-            plt.legend(loc='best', fontsize=10)
+            if any(data["x_vals"] for data in layer_data_map.values()): # Only add legend if there's data
+                plt.legend(loc='best', fontsize=10)
             plt.grid(True, which="both", linestyle="--", linewidth=0.5)
             plt.tight_layout()
             
-            plot_filename = f"{filename_prefix}_{fn_name}.png"
+            plot_filename = f"{self._sanitize_filename_component(filename_prefix)}_{self._sanitize_filename_component(fn_name)}.png"
             filepath = os.path.join(self.output_dir, plot_filename)
             plt.savefig(filepath)
             plt.close()
@@ -412,17 +378,15 @@ class Plotter:
                                                 Defaults to None.
         """
         if layer_name not in snapshot1.model_state or layer_name not in snapshot2.model_state:
-            print(f"[Plotter] Layer '{layer_name}' not found in one or both snapshots. Cannot plot heatmap.")
+            print(f"[Plotter] Layer '{layer_name}' not found in one or both snapshots for heatmap.")
             return
-
-        w1 = snapshot1.model_state[layer_name]
-        w2 = snapshot2.model_state[layer_name]
-
+        w1, w2 = snapshot1.model_state[layer_name], snapshot2.model_state[layer_name]
         if w1.shape != w2.shape:
-            print(f"[Plotter] Shapes of layer '{layer_name}' differ: {w1.shape} vs {w2.shape}. Cannot plot heatmap.")
+            print(f"[Plotter] Shape mismatch for '{layer_name}': {w1.shape} vs {w2.shape} for heatmap.")
             return
-        
+
         diff_tensor = w2 - w1
+        plot_values = torch.zeros_like(diff_tensor) # Placeholder
         mode_title_prefix = ""
 
         if mode == "raw":
@@ -432,135 +396,174 @@ class Plotter:
             plot_values = diff_tensor / (torch.abs(w1) + self.epsilon)
             mode_title_prefix = "Percentage"
         elif mode == "standardized":
-            mean_diff = torch.mean(diff_tensor.float()) # Ensure float for mean/std
+            mean_diff = torch.mean(diff_tensor.float())
             std_diff = torch.std(diff_tensor.float())
-            plot_values = (diff_tensor - mean_diff) / (std_diff + self.epsilon)
+            plot_values = (diff_tensor.float() - mean_diff) / (std_diff + self.epsilon)
             mode_title_prefix = "Standardized (Z-score)"
         else:
-            print(f"[Plotter] Unknown heatmap mode: {mode}. Defaulting to 'raw'.")
+            print(f"[Plotter] Unknown heatmap mode '{mode}'. Defaulting to 'raw'.")
             plot_values = diff_tensor
             mode_title_prefix = "Raw"
         
         original_ndim = plot_values.ndim
-        if original_ndim == 1: # For bias vectors, reshape to 2D for heatmap
+        y_label, x_label = "Weight Index (Dim 0)", "Weight Index (Dim 1)"
+        if original_ndim == 1: 
             plot_values = plot_values.unsqueeze(0)
-            y_label = f"{layer_name} (Bias)"
-            x_label = "Bias Element Index"
-        elif original_ndim == 0: # Scalar tensor
-             print(f"[Plotter] Layer '{layer_name}' is a scalar. Heatmap not suitable.")
+            y_label, x_label = f"{layer_name} (Bias)", "Bias Element Index"
+        elif original_ndim == 0:
+             print(f"[Plotter] Layer '{layer_name}' is scalar. Heatmap not suitable.")
              return
-        elif original_ndim > 2:
-            if original_ndim == 4: # Typical Conv2D: (out_channels, in_channels, kH, kW)
-                # Reduce to 2D by taking L2 norm of the change components within each filter
-                plot_values = torch.norm(plot_values.flatten(2), p=2, dim=2)
-                print(f"[Plotter] Info: Layer '{layer_name}' is 4D. Heatmap shows L2 norm of '{mode}' change for each [out_ch, in_ch] filter.")
-                y_label = "Output Channel Index (Dim 0)"
-                x_label = "Input Channel Index (Dim 1)"
-            else: # Other >2D tensors
-                print(f"[Plotter] Layer '{layer_name}' has {original_ndim} dims. Heatmap for >2D (non-4D) not implemented. Trying to flatten last two dims if possible.")
-                try:
-                    h, w = plot_values.shape[-2], plot_values.shape[-1]
-                    plot_values = plot_values.reshape(-1, w) # Flatten all but last dim
-                    y_label = "Flattened Dims"
-                    x_label = f"Original Dim {original_ndim-1} Index"
-                except:
-                    print(f"[Plotter] Could not reshape {original_ndim}D tensor for heatmap. Skipping.")
-                    return
-        else: # 2D tensor (e.g. Linear layer weights)
-            y_label = "Output Unit Index (Dim 0)"
-            x_label = "Input Unit Index (Dim 1)"
-
-
+        elif original_ndim == 4:
+            plot_values = torch.norm(plot_values.flatten(2), p=2, dim=2)
+            print(f"[Plotter] Info: 4D Layer '{layer_name}' heatmap shows L2 norm of '{mode}' change per filter.")
+            y_label, x_label = "Output Channel Index (Dim 0)", "Input Channel Index (Dim 1)"
+        elif original_ndim > 2 and original_ndim != 4: # Other >2D tensors
+            print(f"[Plotter] Warning: Layer '{layer_name}' has {original_ndim} dims. Flattening for heatmap.")
+            try:
+                plot_values = plot_values.reshape(-1, plot_values.shape[-1])
+                y_label, x_label = "Flattened Dims", f"Original Dim {original_ndim-1} Index"
+            except Exception as e:
+                print(f"[Plotter] Failed to reshape {original_ndim}D tensor for '{layer_name}': {e}. Skipping heatmap.")
+                return
+        
         plt.figure(figsize=(10, 8))
-        center_val = 0 if mode in ["raw", "standardized"] or (plot_values.min() < 0 and plot_values.max() > 0) else None
-        
+        center_val = 0 if mode in ["raw", "standardized"] or (plot_values.min().item() < 0 and plot_values.max().item() > 0) else None
         sns.heatmap(plot_values.cpu().numpy(), annot=False, cmap="coolwarm", center=center_val, robust=robust_colormap, fmt=".2f")
-        
-        s1_epoch = snapshot1.metadata.get('epoch', 'S1')
-        s2_epoch = snapshot2.metadata.get('epoch', 'S2')
-        s1_step = snapshot1.metadata.get('step', 's1')
-        s2_step = snapshot2.metadata.get('step', 's2')
-
-        title = (f'{mode_title_prefix} Change Heatmap: {layer_name}\n'
-                 f'Snap {s2_epoch}(st{s2_step}) - Snap {s1_epoch}(st{s1_step})')
-        plt.title(title, fontsize=14)
-        plt.xlabel(x_label, fontsize=12)
-        plt.ylabel(y_label, fontsize=12)
+        s1_id = f"S{snapshot1.metadata.get('epoch','?')}(st{snapshot1.metadata.get('step','?')})"
+        s2_id = f"S{snapshot2.metadata.get('epoch','?')}(st{snapshot2.metadata.get('step','?')})"
+        plt.title(f'{mode_title_prefix} Change Heatmap: {layer_name}\n({s2_id} - {s1_id})', fontsize=14)
+        plt.xlabel(x_label, fontsize=12); plt.ylabel(y_label, fontsize=12)
         plt.tight_layout()
 
         if filename is None:
-            safe_layer_name = layer_name.replace('.', '_').replace('[', '_').replace(']', '')
-            filename = f"heatmap_{mode}_{safe_layer_name}_e{s1_epoch}_vs_e{s2_epoch}.png"
+            fn = f"heatmap_{mode}_{self._sanitize_filename_component(layer_name)}_{s1_id}_vs_{s2_id}.png"
+        else:
+            fn = self._sanitize_filename_component(filename)
+        filepath = os.path.join(self.output_dir, fn)
+        plt.savefig(filepath); plt.close()
+        print(f"[Plotter] Plot saved: {filepath}")
+
+    def plot_layer_change_distribution(self, 
+                                       snapshot1: Snapshot, 
+                                       snapshot2: Snapshot, 
+                                       layer_name: str,
+                                       mode: str = "raw", 
+                                       bins: int = 50,
+                                       filename: Optional[str] = None):
+        """
+        Plots a histogram of the distribution of weight changes in a specific layer.
+
+        Args:
+            snapshot1 (Snapshot): The first snapshot.
+            snapshot2 (Snapshot): The second snapshot.
+            layer_name (str): The name of the layer to analyze.
+            mode (str, optional): Mode for calculating differences ('raw', 'percentage', 'standardized').
+                                Defaults to "raw".
+            bins (int, optional): Number of bins for the histogram. Defaults to 50.
+            filename (Optional[str], optional): Name for the output plot file. Defaults to None.
+        """
+        if layer_name not in snapshot1.model_state or layer_name not in snapshot2.model_state:
+            print(f"[Plotter] Layer '{layer_name}' not in one or both snapshots for distribution plot.")
+            return
+        w1, w2 = snapshot1.model_state[layer_name], snapshot2.model_state[layer_name]
+        if w1.shape != w2.shape:
+            print(f"[Plotter] Shape mismatch for '{layer_name}': {w1.shape} vs {w2.shape} for distribution.")
+            return
+
+        diff_tensor = w2 - w1
+        plot_values = torch.zeros_like(diff_tensor) # Placeholder
+        mode_title_prefix = ""
+        x_hist_label = "Change Value"
+
+        if mode == "raw":
+            plot_values = diff_tensor
+            mode_title_prefix = "Raw"
+            x_hist_label = "Raw Difference (W2 - W1)"
+        elif mode == "percentage":
+            plot_values = diff_tensor / (torch.abs(w1) + self.epsilon)
+            mode_title_prefix = "Percentage"
+            x_hist_label = "Percentage Change ((W2 - W1) / |W1|)"
+        elif mode == "standardized":
+            mean_diff = torch.mean(diff_tensor.float())
+            std_diff = torch.std(diff_tensor.float())
+            plot_values = (diff_tensor.float() - mean_diff) / (std_diff + self.epsilon)
+            mode_title_prefix = "Standardized (Z-score)"
+            x_hist_label = "Standardized Difference (Z-score)"
+        else:
+            print(f"[Plotter] Unknown distribution mode '{mode}'. Defaulting to 'raw'.")
+            plot_values = diff_tensor
+            mode_title_prefix = "Raw"
+            x_hist_label = "Raw Difference (W2 - W1)"
         
-        filepath = os.path.join(self.output_dir, filename)
-        plt.savefig(filepath)
-        plt.close()
+        flattened_values = plot_values.flatten().cpu().numpy()
+
+        plt.figure(figsize=(10, 6))
+        plt.hist(flattened_values, bins=bins, edgecolor='black', alpha=0.7)
+        s1_id = f"S{snapshot1.metadata.get('epoch','?')}(st{snapshot1.metadata.get('step','?')})"
+        s2_id = f"S{snapshot2.metadata.get('epoch','?')}(st{snapshot2.metadata.get('step','?')})"
+        plt.title(f'{mode_title_prefix} Change Distribution: {layer_name}\n({s2_id} - {s1_id})', fontsize=14)
+        plt.xlabel(x_hist_label, fontsize=12)
+        plt.ylabel("Frequency", fontsize=12)
+        plt.grid(axis='y', alpha=0.75)
+        plt.tight_layout()
+
+        if filename is None:
+            fn = f"hist_dist_{mode}_{self._sanitize_filename_component(layer_name)}_{s1_id}_vs_{s2_id}.png"
+        else:
+            fn = self._sanitize_filename_component(filename)
+        filepath = os.path.join(self.output_dir, fn)
+        plt.savefig(filepath); plt.close()
         print(f"[Plotter] Plot saved: {filepath}")
 
 # Example Usage (primary example is run_analysis_example.py)
 if __name__ == '__main__':
-    dummy_comparison_results = [
-        {"snapshot1_metadata": {"epoch": 0, "step": 0}, "snapshot2_metadata": {"epoch": 1, "step": 100}, "aggregate_L2_distance_from_layers": 0.5, "per_layer_L2_distance": {"fc1.weight": 0.3, "fc2.bias": 0.1}},
-        {"snapshot1_metadata": {"epoch": 1, "step": 100}, "snapshot2_metadata": {"epoch": 2, "step": 200}, "aggregate_L2_distance_from_layers": 0.8, "per_layer_L2_distance": {"fc1.weight": 0.4, "fc2.bias": 0.15}},
-    ]
-
-    print("[INFO] Initializing Plotter with dummy comparison_results for L2 distance plots...")
-    plotter1 = Plotter(comparison_results=dummy_comparison_results, output_dir="test_plots_output/distance_plots")
-    plotter1.plot_total_change_over_epochs()
-    plotter1.plot_per_layer_change_over_epochs()
-
+    # Dummy model and snapshots for testing
     class DummyModel(torch.nn.Module):
         def __init__(self, val_offset=0.0):
             super().__init__()
-            self.fc1_w = nn.Parameter(torch.tensor([[0.1, 0.2], [0.3, 0.4]]) + val_offset)
-            self.fc1_b = nn.Parameter(torch.tensor([0.05, 0.15]) + val_offset)
-            self.conv1_w = nn.Parameter(torch.randn(2,1,2,2) + val_offset) # out,in,kH,kW
-            self.scalar_param = nn.Parameter(torch.tensor(1.0) + val_offset)
+            self.fc1_w = nn.Parameter(torch.randn(10,5) * 0.1 + val_offset)
+            self.fc1_b = nn.Parameter(torch.randn(10) * 0.1 + val_offset)
+            self.conv1_w = nn.Parameter(torch.randn(4,2,3,3) * 0.1 + val_offset)
 
         def state_dict(self, destination=None, prefix='', keep_vars=False):
-            # Simplified state_dict for example
-            return {
-                'fc1.weight': self.fc1_w, 
-                'fc1.bias': self.fc1_b,
-                'conv1.weight': self.conv1_w,
-                'scalar_param': self.scalar_param
-            }
+            return {'fc1.weight': self.fc1_w, 'fc1.bias': self.fc1_b, 'conv1.weight': self.conv1_w}
 
-    snapshots_for_heatmaps = [
-        Snapshot(model_state=DummyModel(val_offset=0.0).state_dict(), metadata={"epoch": 0, "step": 0}),
-        Snapshot(model_state=DummyModel(val_offset=0.1).state_dict(), metadata={"epoch": 1, "step": 100}),
-        Snapshot(model_state=DummyModel(val_offset=-0.05).state_dict(), metadata={"epoch": 2, "step": 200})
+    s_initial = Snapshot(model_state=DummyModel(val_offset=0.0).state_dict(), metadata={"epoch": 0, "step": 0})
+    s_epoch5 = Snapshot(model_state=DummyModel(val_offset=0.05).state_dict(), metadata={"epoch": 5, "step": 500})
+    s_epoch10 = Snapshot(model_state=DummyModel(val_offset=-0.02).state_dict(), metadata={"epoch": 10, "step": 1000})
+    all_snaps = [s_initial, s_epoch5, s_epoch10]
+
+    # Dummy comparison results for L2 plots
+    comp_res = [
+        {"snapshot1_metadata": s_initial.metadata, "snapshot2_metadata": s_epoch5.metadata, 
+         "aggregate_L2_distance_from_layers": 0.5, 
+         "per_layer_L2_distance": {"fc1.weight": 0.3, "fc1.bias": 0.1, "conv1.weight":0.2}},
+        {"snapshot1_metadata": s_epoch5.metadata, "snapshot2_metadata": s_epoch10.metadata, 
+         "aggregate_L2_distance_from_layers": 0.8, 
+         "per_layer_L2_distance": {"fc1.weight": 0.4, "fc1.bias": 0.15, "conv1.weight":0.35}}
     ]
 
-    print("\n[INFO] Initializing a new Plotter for trajectory/heatmap plots...")
-    plotter2 = Plotter(output_dir="test_plots_output/trajectory_heatmap_plots") 
+    test_plot_dir = "test_plotter_output_refined"
+    if os.path.exists(test_plot_dir): shutil.rmtree(test_plot_dir)
+    plotter = Plotter(comparison_results=comp_res, output_dir=test_plot_dir)
 
-    print("\n[INFO] Plotting layer difference heatmaps with different modes...")
-    s1 = snapshots_for_heatmaps[0]
-    s2 = snapshots_for_heatmaps[1]
-    s3 = snapshots_for_heatmaps[2]
+    print("--- Testing L2 Distance Plots (with x-axis helper) ---")
+    plotter.plot_total_change_over_epochs()
+    plotter.plot_per_layer_change_over_epochs()
 
-    layers_to_heatmap = ["fc1.weight", "fc1.bias", "conv1.weight", "scalar_param"]
-    modes_to_test = ["raw", "percentage", "standardized"]
+    print("--- Testing Trajectory Plots (with x-axis helper) ---")
+    plotter.plot_specific_weight_trajectories(all_snaps, {"fc1.weight":[(0,0),(1,1)], "conv1.weight":[(0,0,0,0)]})
+    plotter.plot_layer_aggregate_trajectories(all_snaps, {"L2_Norm": lambda t: t.norm().item()})
+    
+    print("--- Testing Refined Heatmaps & New Distribution Plots ---")
+    layers_to_test = ["fc1.weight", "fc1.bias", "conv1.weight"]
+    modes = ["raw", "percentage", "standardized"]
 
-    for layer in layers_to_heatmap:
-        for mode in modes_to_test:
-            print(f"  Testing heatmap: Layer '{layer}', Mode '{mode}' (Snap 0 vs 1)")
-            plotter2.plot_layer_difference_heatmap(s1, s2, layer_name=layer, mode=mode, robust_colormap=True)
-            if layer == "fc1.weight": # Test non-robust and specific filename
-                 print(f"  Testing heatmap: Layer '{layer}', Mode '{mode}' (Snap 0 vs 2, non-robust)")
-                 plotter2.plot_layer_difference_heatmap(s1, s3, layer_name=layer, mode=mode, robust_colormap=False, filename=f"custom_heatmap_{layer}_{mode}_s1s3.png")
+    for layer in layers_to_test:
+        for mode in modes:
+            print(f"Plotting Heatmap: {layer}, mode: {mode}")
+            plotter.plot_layer_difference_heatmap(s_initial, s_epoch10, layer, mode=mode)
+            print(f"Plotting Distribution: {layer}, mode: {mode}")
+            plotter.plot_layer_change_distribution(s_initial, s_epoch10, layer, mode=mode, bins=30)
 
-
-    print("\n[INFO] Plotting specific weight trajectories...")
-    plotter2.plot_specific_weight_trajectories(
-        snapshots=snapshots_for_heatmaps, 
-        weights_to_plot={"fc1.weight": [(0,0), (1,1)], "fc1.bias": [(0,)]}
-    )
-
-    print("\n[INFO] Plotting layer aggregate trajectories...")
-    plotter2.plot_layer_aggregate_trajectories(
-        snapshots=snapshots_for_heatmaps,
-        aggregate_fns={"L2_norm": lambda t: t.norm().item(), "mean_abs": lambda t: t.abs().mean().item()}
-    )
-    print("\n[INFO] Plotting example finished. Check 'test_plots_output' subdirectories.") 
+    print(f"\nAll test plots saved in {test_plot_dir}") 

@@ -121,29 +121,26 @@ def main():
     else:
         print("Skipping L2 distance plots as no comparison results are available.")
 
-    # --- New M10 Plots --- 
-    print("\n--- Generating M10 Trajectory and Heatmap Plots --- ")
+    # --- New M10 Plots & M10.1 Distribution Plots --- 
+    print("\n--- Generating M10 Trajectory/Heatmap & M10.1 Distribution Plots ---")
 
-    # Ensure plotter is initialized. If L2 distance plots were skipped, initialize it here.
     if 'plotter' not in locals() and snapshots_list:
-        print("Initializing Plotter for trajectory and heatmap plots...")
-        plotter = Plotter(output_dir=PLOT_DIR) # No comparison_results needed if only doing these plots
-    elif not snapshots_list:
-        print("Cannot generate M10 plots: No snapshots available.")
+        print("Initializing Plotter for trajectory, heatmap, and distribution plots...")
+        plotter = Plotter(output_dir=PLOT_DIR)
+    elif not snapshots_list or len(snapshots_list) < 2: # Need at least 2 for comparisons
+        print("Cannot generate M10/M10.1 plots: Not enough snapshots available.")
         return
 
-    # 1. Specific Weight Trajectories
+    # Specific Weight Trajectories & Layer Aggregate Trajectories (no changes)
     weights_to_track = {
-        "fc1.weight": [(0,0), (0,1), (10,5)], # (row, col) indices
-        "fc3.bias": [(0,)] # (index,) for bias
+        "fc1.weight": [(0,0), (0,1), (10,5)], 
+        "fc3.bias": [(0,)] 
     }
     plotter.plot_specific_weight_trajectories(
         snapshots=snapshots_list, 
         weights_to_plot=weights_to_track,
         filename_prefix="specific_weights"
     )
-
-    # 2. Layer Aggregate Trajectories
     aggregate_functions = {
         "L2_norm": lambda t: t.norm(p=2).item(),
         "mean_abs_val": lambda t: t.abs().mean().item(),
@@ -152,42 +149,54 @@ def main():
     plotter.plot_layer_aggregate_trajectories(
         snapshots=snapshots_list,
         aggregate_fns=aggregate_functions,
-        # layer_filter=["fc1.weight", "fc3.bias"], # Optional: filter specific layers
         filename_prefix="layer_aggregates"
     )
 
-    # 3. Layer Difference Heatmap - Now with modes
-    if len(snapshots_list) >= 2:
-        initial_snapshot = snapshots_list[0]
-        final_snapshot = snapshots_list[-1]
-        s1_id = f"e{initial_snapshot.metadata.get('epoch','i')}_s{initial_snapshot.metadata.get('step','i')}"
-        s2_id = f"e{final_snapshot.metadata.get('epoch','f')}_s{final_snapshot.metadata.get('step','f')}"
+    # Layer Difference Heatmaps & New Change Distributions
+    initial_snapshot = snapshots_list[0]
+    final_snapshot = snapshots_list[-1]
+    s1_id_meta = initial_snapshot.metadata
+    s2_id_meta = final_snapshot.metadata
+    # Create a compact string for filenames, e.g., e0s0_vs_e4s500
+    s_comp_id = (f"e{s1_id_meta.get('epoch','i')}s{s1_id_meta.get('step','i')}" 
+                 f"_vs_e{s2_id_meta.get('epoch','f')}s{s2_id_meta.get('step','f')}")
 
-        layers_for_heatmap = ["fc1.weight", "fc2.bias"]
-        heatmap_modes = ["raw", "percentage", "standardized"]
+    layers_to_analyze = ["fc1.weight", "fc2.bias"] # fc3.weight could be added if desired
+    analysis_modes = ["raw", "percentage", "standardized"]
+    histogram_bins = 30
 
-        for layer_name_hm in layers_for_heatmap:
-            for mode in heatmap_modes:
-                print(f"Generating heatmap for {layer_name_hm} (mode: {mode}) between {s1_id} and {s2_id}")
-                plotter.plot_layer_difference_heatmap(
-                    initial_snapshot, 
-                    final_snapshot, 
-                    layer_name=layer_name_hm,
-                    mode=mode,
-                    robust_colormap=True, # Default, but can be set to False to test
-                    filename=f"heatmap_{layer_name_hm.replace('.', '_')}_{mode}_{s1_id}_vs_{s2_id}.png"
-                )
-            # Example of non-robust colormap for one mode/layer
-            if layer_name_hm == "fc1.weight":
-                print(f"Generating non-robust heatmap for {layer_name_hm} (mode: raw) between {s1_id} and {s2_id}")
-                plotter.plot_layer_difference_heatmap(
-                    initial_snapshot, 
-                    final_snapshot, 
-                    layer_name=layer_name_hm,
-                    mode="raw",
-                    robust_colormap=False, 
-                    filename=f"heatmap_{layer_name_hm.replace('.', '_')}_raw_nonrobust_{s1_id}_vs_{s2_id}.png"
-                )
+    for layer_name_an in layers_to_analyze:
+        for mode in analysis_modes:
+            print(f"Analyzing layer: {layer_name_an}, mode: {mode} ({s_comp_id})")
+            
+            # Heatmap
+            plotter.plot_layer_difference_heatmap(
+                initial_snapshot, 
+                final_snapshot, 
+                layer_name=layer_name_an,
+                mode=mode,
+                robust_colormap=True,
+                filename=f"heatmap_{layer_name_an.replace('.', '_')}_{mode}_{s_comp_id}.png"
+            )
+
+            # New: Change Distribution Plot
+            plotter.plot_layer_change_distribution(
+                initial_snapshot,
+                final_snapshot,
+                layer_name=layer_name_an,
+                mode=mode,
+                bins=histogram_bins,
+                filename=f"hist_dist_{layer_name_an.replace('.', '_')}_{mode}_{s_comp_id}.png"
+            )
+
+        # Example of non-robust colormap for raw heatmap
+        if layer_name_an == "fc1.weight":
+            print(f"Generating non-robust raw heatmap for {layer_name_an} ({s_comp_id})")
+            plotter.plot_layer_difference_heatmap(
+                initial_snapshot, final_snapshot, layer_name=layer_name_an, mode="raw",
+                robust_colormap=False, 
+                filename=f"heatmap_{layer_name_an.replace('.','_')}_raw_nonrobust_{s_comp_id}.png"
+            )
 
     print("\nNeuro Change Tracker full analysis example finished.")
     print(f"Snapshots are in: {tracker.save_dir}")
