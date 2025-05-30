@@ -29,4 +29,6 @@ Thumbs.db
 
 # Snapshot data (if we decide to keep it out of git by default)
 neuro_snapshots/
-test_snapshots_output/ 
+test_snapshots_output/
+test_tracker_output/
+full_analysis_output/ 
