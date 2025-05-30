@@ -124,9 +124,15 @@ def main():
     # --- New M10 Plots --- 
     print("\n--- Generating M10 Trajectory and Heatmap Plots --- ")
 
+    # Ensure plotter is initialized. If L2 distance plots were skipped, initialize it here.
+    if 'plotter' not in locals() and snapshots_list:
+        print("Initializing Plotter for trajectory and heatmap plots...")
+        plotter = Plotter(output_dir=PLOT_DIR) # No comparison_results needed if only doing these plots
+    elif not snapshots_list:
+        print("Cannot generate M10 plots: No snapshots available.")
+        return
+
     # 1. Specific Weight Trajectories
-    # For our SimpleMLP: fc1.weight is 128x784, fc1.bias is 128, etc.
-    # Let's plot a few weights from fc1.weight and one from fc3.bias
     weights_to_track = {
         "fc1.weight": [(0,0), (0,1), (10,5)], # (row, col) indices
         "fc3.bias": [(0,)] # (index,) for bias
@@ -150,24 +156,38 @@ def main():
         filename_prefix="layer_aggregates"
     )
 
-    # 3. Layer Difference Heatmap
-    # Example: Difference in 'fc1.weight' between initial (snapshot 0) and final (snapshot -1)
+    # 3. Layer Difference Heatmap - Now with modes
     if len(snapshots_list) >= 2:
         initial_snapshot = snapshots_list[0]
         final_snapshot = snapshots_list[-1]
-        plotter.plot_layer_difference_heatmap(
-            initial_snapshot, 
-            final_snapshot, 
-            layer_name="fc1.weight",
-            filename=f"heatmap_fc1.weight_e{initial_snapshot.metadata.get('epoch','i')}_vs_e{final_snapshot.metadata.get('epoch','f')}.png"
-        )
-        # Example for a bias layer
-        plotter.plot_layer_difference_heatmap(
-            initial_snapshot, 
-            final_snapshot, 
-            layer_name="fc2.bias",
-            filename=f"heatmap_fc2.bias_e{initial_snapshot.metadata.get('epoch','i')}_vs_e{final_snapshot.metadata.get('epoch','f')}.png"
-        )
+        s1_id = f"e{initial_snapshot.metadata.get('epoch','i')}_s{initial_snapshot.metadata.get('step','i')}"
+        s2_id = f"e{final_snapshot.metadata.get('epoch','f')}_s{final_snapshot.metadata.get('step','f')}"
+
+        layers_for_heatmap = ["fc1.weight", "fc2.bias"]
+        heatmap_modes = ["raw", "percentage", "standardized"]
+
+        for layer_name_hm in layers_for_heatmap:
+            for mode in heatmap_modes:
+                print(f"Generating heatmap for {layer_name_hm} (mode: {mode}) between {s1_id} and {s2_id}")
+                plotter.plot_layer_difference_heatmap(
+                    initial_snapshot, 
+                    final_snapshot, 
+                    layer_name=layer_name_hm,
+                    mode=mode,
+                    robust_colormap=True, # Default, but can be set to False to test
+                    filename=f"heatmap_{layer_name_hm.replace('.', '_')}_{mode}_{s1_id}_vs_{s2_id}.png"
+                )
+            # Example of non-robust colormap for one mode/layer
+            if layer_name_hm == "fc1.weight":
+                print(f"Generating non-robust heatmap for {layer_name_hm} (mode: raw) between {s1_id} and {s2_id}")
+                plotter.plot_layer_difference_heatmap(
+                    initial_snapshot, 
+                    final_snapshot, 
+                    layer_name=layer_name_hm,
+                    mode="raw",
+                    robust_colormap=False, 
+                    filename=f"heatmap_{layer_name_hm.replace('.', '_')}_raw_nonrobust_{s1_id}_vs_{s2_id}.png"
+                )
 
     print("\nNeuro Change Tracker full analysis example finished.")
     print(f"Snapshots are in: {tracker.save_dir}")
